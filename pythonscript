@@ -1,0 +1,1002 @@
+"""
+HashCrack - CustomTkinter GUI for Hashcat because I hated using the command line for CTFs AND somehow I always broke it.
+"CTF" Hash Cracking Tool
+
+Requirements:  pip install customtkinter
+Also requires:  Hashcat, obviously. You just need to get to the hashcat.exe path.
+
+"""
+
+import customtkinter as ctk
+import subprocess
+import threading
+import os
+import re
+import json
+import shutil
+import tempfile
+import time
+from pathlib import Path
+from datetime import datetime
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+CONFIG_FILE = Path.home() / ".hashcrack_pro_config.json"
+
+DEFAULT_CONFIG = {
+    "hashcat_path": "hashcat",
+    "wordlist_path": "",
+    "rules_path": "",
+    "last_hash_type": "0",
+    "attack_mode": "0",
+    "custom_args": "",
+}
+
+HASH_TYPES = {
+    "0    - MD5":                        "0",
+    "10   - md5($pass.$salt)":           "10",
+    "20   - md5($salt.$pass)":           "20",
+    "100  - SHA1":                       "100",
+    "1400 - SHA2-256":                   "1400",
+    "1700 - SHA2-512":                   "1700",
+    "1800 - sha512crypt (Linux $6$)":    "1800",
+    "3200 - bcrypt":                     "3200",
+    "500  - md5crypt (Linux $1$)":       "500",
+    "1000 - NTLM":                       "1000",
+    "3000 - LM":                         "3000",
+    "5500 - NetNTLMv1":                  "5500",
+    "5600 - NetNTLMv2":                  "5600",
+    "1600 - Apache $apr1$":              "1600",
+    "7400 - sha256crypt (Linux $5$)":    "7400",
+    "400  - phpass":                     "400",
+    "2500 - WPA-PBKDF2-PMKID+EAPOL":    "2500",
+    "22000- WPA-PBKDF2-PMKID+EAPOL v2": "22000",
+    "11300- Bitcoin/Litecoin wallet":    "11300",
+    "13400- KeePass 1/2 AES":           "13400",
+    "18200- Kerberos 5 AS-REP":         "18200",
+    "13100- Kerberos 5 TGS-REP":        "13100",
+    "16500- JWT (JSON Web Token)":       "16500",
+    "Custom...":                         "custom",
+}
+
+ATTACK_MODES = {
+    "0 - Straight (Wordlist)":  "0",
+    "1 - Combination":          "1",
+    "3 - Brute-force / Mask":   "3",
+    "6 - Hybrid Wordlist+Mask": "6",
+    "7 - Hybrid Mask+Wordlist": "7",
+}
+
+# ── Palette ───────────────────────────────────────────────────────────────────
+# Pure terminal monochrome. Only green (cracked / terminal output) and
+# red/green (stop/start buttons) are allowed to deviate from B&W.
+
+BG_ROOT      = "#000000"   # absolute black root window
+BG_SIDEBAR   = "#0a0a0a"   # near-black sidebar
+BG_LOGO      = "#111111"   # slightly lifted logo bar
+BG_SECTION   = "#0d0d0d"   # section divider band
+BG_PANEL     = "#0d0d0d"   # panel background
+BG_HEADER    = "#161616"   # panel header bar
+BG_ENTRY     = "#0a0a0a"   # text entry field
+BG_BTN       = "#1a1a1a"   # neutral button
+BG_BTN_HOV   = "#2a2a2a"   # neutral button hover
+BG_TOOLBAR   = "#111111"   # top toolbar
+BG_STATUSBAR = "#080808"   # bottom status strip
+
+BG_HASH_INPUT = "#000000"  # hash paste area
+BG_RESULTS    = "#000000"  # cracked passwords area
+BG_LOG        = "#000000"  # hashcat terminal output
+
+BORDER_BRIGHT = "#444444"  # bright widget borders
+BORDER_DIM    = "#2a2a2a"  # dim panel borders
+
+TXT_WHITE     = "#ffffff"  # primary text
+TXT_LIGHT     = "#cccccc"  # secondary text
+TXT_MID       = "#888888"  # muted labels
+TXT_DIM       = "#555555"  # very muted / hints
+TXT_GREEN     = "#00ff88"  # cracked passwords
+TXT_TERMINAL  = "#00ff66"  # hashcat log output (green terminal)
+TXT_HASH_IN   = "#dddddd"  # hash input text (near-white)
+
+# Functional colours (keep as-is)
+BTN_START_BG  = "#003a20"
+BTN_START_HOV = "#004d2a"
+BTN_START_TXT = "#00ff88"
+BTN_STOP_BG   = "#3a0010"
+BTN_STOP_HOV  = "#550018"
+BTN_STOP_TXT  = "#ff4466"
+
+FONT_MONO  = "Courier New"
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                return {**DEFAULT_CONFIG, **json.load(f)}
+        except Exception:
+            pass
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def hashcat_cwd(hc_path: str):
+    """
+    Return the cwd for launching hashcat so it finds ./OpenCL/ etc.
+    Returns the binary's parent dir if the path contains separators,
+    otherwise None (bare command on PATH).
+    """
+    p = Path(hc_path)
+    if p.is_absolute() or os.sep in hc_path or (os.altsep and os.altsep in hc_path):
+        return str(p.parent)
+    return None
+
+
+def get_potfile_paths(hc_path: str) -> list:
+    """
+    Return candidate potfile locations in priority order.
+
+    On Windows, hashcat stores the potfile next to the exe by default
+    (e.g. D:/hashcat/hashcat.potfile), NOT in ~/.hashcat/.
+    We check both so we catch it regardless of the user's hashcat config.
+    """
+    candidates = []
+
+    # 1. Next to the hashcat binary (Windows default)
+    hc = Path(hc_path)
+    if hc.is_absolute() or os.sep in hc_path or (os.altsep and os.altsep in hc_path):
+        candidates.append(hc.parent / "hashcat.potfile")
+
+    # 2. ~/.hashcat/hashcat.potfile  (Linux / Mac default, also common on Windows)
+    candidates.append(Path.home() / ".hashcat" / "hashcat.potfile")
+
+    # 3. %APPDATA%\hashcat\hashcat.potfile  (some Windows installs)
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "hashcat" / "hashcat.potfile")
+
+    return candidates
+
+
+def detect_hash_type(hash_str: str) -> str:
+    h = hash_str.strip()
+    if h.startswith(("$2y$", "$2b$", "$2a$")): return "3200"
+    if h.startswith("$1$"):                     return "500"
+    if h.startswith("$5$"):                     return "7400"
+    if h.startswith("$6$"):                     return "1800"
+    if h.startswith("$apr1$"):                  return "1600"
+    if h.startswith(("$P$", "$H$")):            return "400"
+    if re.fullmatch(r'[a-fA-F0-9]{32}', h):     return "0"
+    if re.fullmatch(r'[a-fA-F0-9]{40}', h):     return "100"
+    if re.fullmatch(r'[a-fA-F0-9]{64}', h):     return "1400"
+    if re.fullmatch(r'[a-fA-F0-9]{128}', h):    return "1700"
+    return ""
+
+
+# ─── Main Application ─────────────────────────────────────────────────────────
+
+class HashCrackPro(ctk.CTk):
+
+    def __init__(self):
+        super().__init__()
+        self.config = load_config()
+        self.process = None
+        self.cracking = False
+        self.temp_hash_file = None
+        self.results = {}
+        self._hash_set = set()
+        self.start_time = None
+
+        self._build_ui()
+        self.after(200, self._check_hashcat)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # UI
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.title("HashCrack - totti's super mega CTF hash cracking GUI")
+        self.geometry("1100x820")
+        self.minsize(900, 650)
+        self.configure(fg_color=BG_ROOT)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self._build_sidebar()
+        self._build_main()
+        self._build_statusbar()
+
+    def _build_sidebar(self):
+        sb = ctk.CTkFrame(self, width=270, fg_color=BG_SIDEBAR, corner_radius=0)
+        sb.grid(row=0, column=0, sticky="nsew", rowspan=2)
+        sb.grid_rowconfigure(20, weight=1)
+        sb.grid_propagate(False)
+        sb.grid_columnconfigure(0, weight=1)
+
+        # Logo block
+        logo = ctk.CTkFrame(sb, fg_color=BG_LOGO, corner_radius=0)
+        logo.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(logo, text="HASHCRACK✦︎",
+                     font=ctk.CTkFont(family=FONT_MONO, size=30, weight="bold"),
+                     text_color=TXT_WHITE).pack(pady=(18, 3), padx=20, anchor="w")
+        ctk.CTkLabel(logo, text="this is for idiots who keep breaking hashcat (me)",
+                     font=ctk.CTkFont(family=FONT_MONO, size=12),
+                     text_color=TXT_DIM).pack(pady=(0, 14), padx=20, anchor="w")
+
+        self._sb_section(sb, "SETTINGS", row=1)
+
+        # Hashcat path. Make sure to do this. It's the most important setting and the one that causes the most issues if wrong, 
+        # so it deserves prime real estate on the sidebar.
+
+        ctk.CTkLabel(sb, text="Hashcat Path", text_color=TXT_MID,
+                     font=ctk.CTkFont(family=FONT_MONO, size=11)
+                     ).grid(row=2, column=0, sticky="w", padx=16, pady=(4, 0))
+        hc_row = ctk.CTkFrame(sb, fg_color="transparent")
+        hc_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 4))
+        hc_row.grid_columnconfigure(0, weight=1)
+        self.hc_path_var = ctk.StringVar(value=self.config["hashcat_path"])
+        ctk.CTkEntry(hc_row, textvariable=self.hc_path_var,
+                     font=ctk.CTkFont(family=FONT_MONO, size=11),
+                     fg_color=BG_ENTRY, border_color=BORDER_BRIGHT,
+                     text_color=TXT_LIGHT).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(hc_row, text="...", width=28, command=self._browse_hashcat,
+                      fg_color=BG_BTN, hover_color=BG_BTN_HOV,
+                      text_color=TXT_LIGHT, font=ctk.CTkFont(family=FONT_MONO, size=11)
+                      ).grid(row=0, column=1, padx=(4, 0))
+
+        # Wordlist stuff that's totally not important.
+        ctk.CTkLabel(sb, text="Wordlist", text_color=TXT_MID,
+                     font=ctk.CTkFont(family=FONT_MONO, size=11)
+                     ).grid(row=4, column=0, sticky="w", padx=16, pady=(6, 0))
+        wl_row = ctk.CTkFrame(sb, fg_color="transparent")
+        wl_row.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 4))
+        wl_row.grid_columnconfigure(0, weight=1)
+        self.wordlist_var = ctk.StringVar(value=self.config["wordlist_path"])
+        ctk.CTkEntry(wl_row, textvariable=self.wordlist_var,
+                     placeholder_text="/path/to/rockyou.txt",
+                     font=ctk.CTkFont(family=FONT_MONO, size=11),
+                     fg_color=BG_ENTRY, border_color=BORDER_BRIGHT,
+                     text_color=TXT_LIGHT).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(wl_row, text="...", width=28, command=self._browse_wordlist,
+                      fg_color=BG_BTN, hover_color=BG_BTN_HOV,
+                      text_color=TXT_LIGHT, font=ctk.CTkFont(family=FONT_MONO, size=11)
+                      ).grid(row=0, column=1, padx=(4, 0))
+
+        # Rules
+        ctk.CTkLabel(sb, text="Rules File (optional)", text_color=TXT_MID,
+                     font=ctk.CTkFont(family=FONT_MONO, size=11)
+                     ).grid(row=6, column=0, sticky="w", padx=16, pady=(6, 0))
+        rl_row = ctk.CTkFrame(sb, fg_color="transparent")
+        rl_row.grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 4))
+        rl_row.grid_columnconfigure(0, weight=1)
+        self.rules_var = ctk.StringVar(value=self.config["rules_path"])
+        ctk.CTkEntry(rl_row, textvariable=self.rules_var,
+                     placeholder_text="best64.rule",
+                     font=ctk.CTkFont(family=FONT_MONO, size=11),
+                     fg_color=BG_ENTRY, border_color=BORDER_BRIGHT,
+                     text_color=TXT_LIGHT).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(rl_row, text="...", width=28, command=self._browse_rules,
+                      fg_color=BG_BTN, hover_color=BG_BTN_HOV,
+                      text_color=TXT_LIGHT, font=ctk.CTkFont(family=FONT_MONO, size=11)
+                      ).grid(row=0, column=1, padx=(4, 0))
+
+        self._sb_section(sb, "HASH CONFIG", row=8)
+
+        # Hash type
+        ctk.CTkLabel(sb, text="Hash Type", text_color=TXT_MID,
+                     font=ctk.CTkFont(family=FONT_MONO, size=11)
+                     ).grid(row=9, column=0, sticky="w", padx=16, pady=(4, 0))
+        self.hash_type_var = ctk.StringVar(value=list(HASH_TYPES.keys())[0])
+        self.hash_type_menu = ctk.CTkOptionMenu(
+            sb, variable=self.hash_type_var, values=list(HASH_TYPES.keys()),
+            command=self._on_hash_type_change,
+            fg_color=BG_BTN, button_color=BORDER_BRIGHT,
+            button_hover_color=BG_BTN_HOV,
+            dropdown_fg_color="#111111",
+            dropdown_text_color=TXT_LIGHT,
+            dropdown_hover_color=BG_BTN_HOV,
+            text_color=TXT_LIGHT,
+            font=ctk.CTkFont(family=FONT_MONO, size=11), width=246)
+        self.hash_type_menu.grid(row=10, column=0, sticky="ew", padx=12, pady=(0, 4))
+
+        self.custom_mode_frame = ctk.CTkFrame(sb, fg_color="transparent")
+        self.custom_mode_frame.grid(row=11, column=0, sticky="ew", padx=12)
+        self.custom_mode_frame.grid_columnconfigure(0, weight=1)
+        self.custom_mode_var = ctk.StringVar(value=self.config.get("last_hash_type", "0"))
+        ctk.CTkEntry(self.custom_mode_frame, textvariable=self.custom_mode_var,
+                     placeholder_text="Enter hash mode number",
+                     font=ctk.CTkFont(family=FONT_MONO, size=11),
+                     fg_color=BG_ENTRY, border_color=BORDER_BRIGHT,
+                     text_color=TXT_LIGHT).grid(row=0, column=0, sticky="ew")
+        self.custom_mode_frame.grid_remove()
+
+        # Attack mode
+        ctk.CTkLabel(sb, text="Attack Mode", text_color=TXT_MID,
+                     font=ctk.CTkFont(family=FONT_MONO, size=11)
+                     ).grid(row=12, column=0, sticky="w", padx=16, pady=(6, 0))
+        self.attack_mode_var = ctk.StringVar(value=list(ATTACK_MODES.keys())[0])
+        ctk.CTkOptionMenu(sb, variable=self.attack_mode_var, values=list(ATTACK_MODES.keys()),
+                          fg_color=BG_BTN, button_color=BORDER_BRIGHT,
+                          button_hover_color=BG_BTN_HOV,
+                          dropdown_fg_color="#111111",
+                          dropdown_text_color=TXT_LIGHT,
+                          dropdown_hover_color=BG_BTN_HOV,
+                          text_color=TXT_LIGHT,
+                          font=ctk.CTkFont(family=FONT_MONO, size=11), width=246
+                          ).grid(row=13, column=0, sticky="ew", padx=12, pady=(0, 4))
+
+        # Extra args
+        ctk.CTkLabel(sb, text="Extra Arguments", text_color=TXT_MID,
+                     font=ctk.CTkFont(family=FONT_MONO, size=11)
+                     ).grid(row=14, column=0, sticky="w", padx=16, pady=(6, 0))
+        self.extra_args_var = ctk.StringVar(value=self.config.get("custom_args", ""))
+        ctk.CTkEntry(sb, textvariable=self.extra_args_var,
+                     placeholder_text="e.g. --increment",
+                     font=ctk.CTkFont(family=FONT_MONO, size=11),
+                     fg_color=BG_ENTRY, border_color=BORDER_BRIGHT,
+                     text_color=TXT_LIGHT
+                     ).grid(row=15, column=0, sticky="ew", padx=12, pady=(0, 4))
+
+        # Action buttons
+        ctk.CTkButton(sb, text="Auto-Detect Hash Type", command=self._auto_detect,
+                      fg_color=BG_BTN, hover_color=BG_BTN_HOV,
+                      text_color=TXT_LIGHT,
+                      font=ctk.CTkFont(family=FONT_MONO, size=11), height=30
+                      ).grid(row=16, column=0, sticky="ew", padx=12, pady=(6, 2))
+
+        ctk.CTkButton(sb, text="Save Settings", command=self._save_settings,
+                      fg_color=BG_BTN, hover_color=BG_BTN_HOV,
+                      text_color=TXT_LIGHT,
+                      font=ctk.CTkFont(family=FONT_MONO, size=11), height=30
+                      ).grid(row=17, column=0, sticky="ew", padx=12, pady=(2, 2))
+
+        ctk.CTkButton(sb, text="Diagnose Path", command=self._diagnose_path,
+                      fg_color=BG_BTN, hover_color=BG_BTN_HOV,
+                      text_color=TXT_MID,
+                      font=ctk.CTkFont(family=FONT_MONO, size=11), height=30
+                      ).grid(row=18, column=0, sticky="ew", padx=12, pady=(2, 8))
+
+        self.hc_status_label = ctk.CTkLabel(sb, text="Checking hashcat...",
+                                            text_color=TXT_DIM,
+                                            font=ctk.CTkFont(family=FONT_MONO, size=11))
+        self.hc_status_label.grid(row=19, column=0, padx=16, pady=(0, 8), sticky="w")
+
+    def _sb_section(self, parent, text, row):
+        """Horizontal divider band with section label."""
+        f = ctk.CTkFrame(parent, fg_color=BG_SECTION, height=24, corner_radius=0)
+        f.grid(row=row, column=0, sticky="ew", padx=0, pady=(10, 0))
+        ctk.CTkLabel(f, text=f"-- {text} --",
+                     font=ctk.CTkFont(family=FONT_MONO, size=9, weight="bold"),
+                     text_color=TXT_DIM).pack(side="left", padx=16, pady=4)
+
+    def _build_main(self):
+        main = ctk.CTkFrame(self, fg_color=BG_ROOT, corner_radius=0)
+        main.grid(row=0, column=1, sticky="nsew")
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(1, weight=1)
+
+        # Toolbar
+        toolbar = ctk.CTkFrame(main, fg_color=BG_TOOLBAR, corner_radius=0, height=54)
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.grid_propagate(False)
+
+        self.crack_btn = ctk.CTkButton(
+            toolbar, text="START CRACKING", command=self._start_crack,
+            fg_color=BTN_START_BG, hover_color=BTN_START_HOV, text_color=BTN_START_TXT,
+            font=ctk.CTkFont(family=FONT_MONO, size=18, weight="bold"),
+            width=180, height=36, corner_radius=2)
+        self.crack_btn.pack(side="left", padx=(16, 8), pady=9)
+
+        self.stop_btn = ctk.CTkButton(
+            toolbar, text="STOP", command=self._stop_crack,
+            fg_color=BTN_STOP_BG, hover_color=BTN_STOP_HOV, text_color=BTN_STOP_TXT,
+            font=ctk.CTkFont(family=FONT_MONO, size=18, weight="bold"),
+            width=80, height=36, corner_radius=2, state="disabled")
+        self.stop_btn.pack(side="left", padx=(0, 8), pady=9)
+
+        # Separator
+        ctk.CTkFrame(toolbar, fg_color=BORDER_DIM, width=1).pack(
+            side="left", fill="y", pady=12, padx=(0, 8))
+
+        for label, cmd, w in [
+            ("Clear All",      self._clear_all,      90),
+            ("Copy Results",   self._copy_results,   110),
+            ("Export Results", self._export_results, 120),
+        ]:
+            ctk.CTkButton(toolbar, text=label, command=cmd,
+                          fg_color=BG_BTN, hover_color=BG_BTN_HOV,
+                          text_color=TXT_MID,
+                          font=ctk.CTkFont(family=FONT_MONO, size=11),
+                          width=w, height=36, corner_radius=2
+                          ).pack(side="left", padx=(0, 6), pady=9)
+
+        self.timer_label = ctk.CTkLabel(toolbar, text="", text_color=TXT_DIM,
+                                        font=ctk.CTkFont(family=FONT_MONO, size=12))
+        self.timer_label.pack(side="right", padx=16)
+
+        # Content grid
+        content = ctk.CTkFrame(main, fg_color="transparent")
+        content.grid(row=1, column=0, sticky="nsew", padx=10, pady=(10, 0))
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(0, weight=3)
+        content.grid_rowconfigure(1, weight=2)
+
+        # ── Hash input panel ──────────────────────────────────────────────────
+        hash_panel = ctk.CTkFrame(content, fg_color=BG_PANEL, corner_radius=0,
+                                  border_width=1, border_color=BORDER_DIM)
+        hash_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 5))
+        hash_panel.grid_columnconfigure(0, weight=1)
+        hash_panel.grid_rowconfigure(1, weight=1)
+
+        hdr1 = ctk.CTkFrame(hash_panel, fg_color=BG_HEADER, corner_radius=0)
+        hdr1.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(hdr1, text="HASHES",
+                     font=ctk.CTkFont(family=FONT_MONO, size=18, weight="bold"),
+                     text_color=TXT_WHITE).pack(side="left", padx=14, pady=8)
+        ctk.CTkLabel(hdr1, text="paste one per line",
+                     font=ctk.CTkFont(family=FONT_MONO, size=10),
+                     text_color=TXT_DIM).pack(side="left", padx=(0, 14), pady=8)
+        self.hash_count_label = ctk.CTkLabel(hdr1, text="0 hashes",
+                                             font=ctk.CTkFont(family=FONT_MONO, size=10),
+                                             text_color=TXT_MID)
+        self.hash_count_label.pack(side="right", padx=14)
+
+        self.hash_input = ctk.CTkTextbox(
+            hash_panel,
+            fg_color=BG_HASH_INPUT,
+            text_color=TXT_LIGHT,
+            font=ctk.CTkFont(family=FONT_MONO, size=12),
+            border_width=0,
+            corner_radius=0,
+            scrollbar_button_color=BORDER_DIM,
+            scrollbar_button_hover_color=BORDER_BRIGHT)
+        self.hash_input.grid(row=1, column=0, sticky="nsew")
+        self.hash_input.bind("<KeyRelease>", self._update_hash_count)
+        self.hash_input.bind("<<Paste>>", lambda e: self.after(50, self._update_hash_count))
+
+        ctk.CTkLabel(hash_panel, text="Ctrl+V to paste  |  MD5, SHA1, SHA256, NTLM, bcrypt...",
+                     font=ctk.CTkFont(family=FONT_MONO, size=9),
+                     text_color=TXT_DIM
+                     ).grid(row=2, column=0, sticky="w", padx=10, pady=4)
+
+        # Cracked passwords panel
+        res_panel = ctk.CTkFrame(content, fg_color=BG_PANEL, corner_radius=0,
+                                 border_width=1, border_color=BORDER_DIM)
+        res_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=(0, 5))
+        res_panel.grid_columnconfigure(0, weight=1)
+        res_panel.grid_rowconfigure(1, weight=1)
+
+        hdr2 = ctk.CTkFrame(res_panel, fg_color=BG_HEADER, corner_radius=0)
+        hdr2.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(hdr2, text="CRACKED PASSWORDS",
+                     font=ctk.CTkFont(family=FONT_MONO, size=18, weight="bold"),
+                     text_color=TXT_GREEN).pack(side="left", padx=14, pady=8)
+        self.cracked_count_label = ctk.CTkLabel(hdr2, text="0 / 0",
+                                                font=ctk.CTkFont(family=FONT_MONO, size=10),
+                                                text_color=TXT_MID)
+        self.cracked_count_label.pack(side="right", padx=14)
+
+        self.results_box = ctk.CTkTextbox(
+            res_panel,
+            fg_color=BG_RESULTS,
+            text_color=TXT_GREEN,
+            font=ctk.CTkFont(family=FONT_MONO, size=12),
+            border_width=0,
+            corner_radius=0,
+            scrollbar_button_color=BORDER_DIM,
+            scrollbar_button_hover_color=BORDER_BRIGHT,
+            state="disabled")
+        self.results_box.grid(row=1, column=0, sticky="nsew")
+
+        ctk.CTkLabel(res_panel, text="output format: hash:password",
+                     font=ctk.CTkFont(family=FONT_MONO, size=9),
+                     text_color=TXT_DIM
+                     ).grid(row=2, column=0, sticky="w", padx=10, pady=4)
+
+        # ── Hashcat output / log panel ────────────────────────────────────────
+        log_panel = ctk.CTkFrame(content, fg_color=BG_PANEL, corner_radius=0,
+                                 border_width=1, border_color=BORDER_DIM)
+        log_panel.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 10))
+        log_panel.grid_columnconfigure(0, weight=1)
+        log_panel.grid_rowconfigure(1, weight=1)
+
+        hdr3 = ctk.CTkFrame(log_panel, fg_color=BG_HEADER, corner_radius=0)
+        hdr3.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(hdr3, text="HASHCAT LOG",
+                     font=ctk.CTkFont(family=FONT_MONO, size=16, weight="bold"),
+                     text_color=TXT_TERMINAL).pack(side="left", padx=14, pady=8)
+        ctk.CTkButton(hdr3, text="Clear", command=self._clear_log,
+                      fg_color="transparent", hover_color=BG_BTN_HOV,
+                      text_color=TXT_DIM,
+                      font=ctk.CTkFont(family=FONT_MONO, size=10),
+                      height=22, width=50).pack(side="right", padx=8)
+
+        self.log_box = ctk.CTkTextbox(
+            log_panel,
+            fg_color=BG_LOG,
+            text_color=TXT_TERMINAL,
+            font=ctk.CTkFont(family=FONT_MONO, size=11),
+            border_width=0,
+            corner_radius=0,
+            scrollbar_button_color=BORDER_DIM,
+            scrollbar_button_hover_color=BORDER_BRIGHT,
+            state="disabled",
+            height=160)
+        self.log_box.grid(row=1, column=0, sticky="nsew")
+
+        # Progress bar — white on black
+        self.progress = ctk.CTkProgressBar(main, fg_color="#111111",
+                                           progress_color="#ffffff",
+                                           height=2, corner_radius=0)
+        self.progress.grid(row=2, column=0, sticky="ew")
+        self.progress.set(0)
+
+    def _build_statusbar(self):
+        sb = ctk.CTkFrame(self, fg_color=BG_STATUSBAR, corner_radius=0, height=24)
+        sb.grid(row=1, column=1, sticky="ew")
+        sb.grid_propagate(False)
+        self.status_label = ctk.CTkLabel(
+            sb,
+            text="Ready  --  paste hashes and configure settings to begin",
+            font=ctk.CTkFont(family=FONT_MONO, size=10),
+            text_color=TXT_DIM)
+        self.status_label.pack(side="left", padx=14)
+
+
+    # Hash Type Handling
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_hash_type_change(self, value):
+        if HASH_TYPES.get(value) == "custom":
+            self.custom_mode_frame.grid()
+        else:
+            self.custom_mode_frame.grid_remove()
+
+    def _get_hash_mode(self):
+        key = self.hash_type_var.get()
+        val = HASH_TYPES.get(key, "0")
+        return (self.custom_mode_var.get().strip() or "0") if val == "custom" else val
+
+    def _get_attack_mode(self):
+        return ATTACK_MODES.get(self.attack_mode_var.get(), "0")
+
+    def _auto_detect(self):
+        raw = self.hash_input.get("1.0", "end").strip()
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        if not lines:
+            self._status("No hashes to detect -- paste some first.", color=TXT_MID)
+            return
+        detected = detect_hash_type(lines[0])
+        if not detected:
+            self._status("Could not auto-detect -- please select manually.", color=TXT_MID)
+            return
+        for key, val in HASH_TYPES.items():
+            if val == detected and val != "custom":
+                self.hash_type_var.set(key)
+                self.hash_type_menu.set(key)
+                self.custom_mode_frame.grid_remove()
+                self._status(f"Detected: {key}  (mode {detected})", color=TXT_LIGHT)
+                return
+        self.hash_type_var.set("Custom...")
+        self.hash_type_menu.set("Custom...")
+        self.custom_mode_var.set(detected)
+        self.custom_mode_frame.grid()
+        self._status(f"Detected mode: {detected}", color=TXT_LIGHT)
+
+
+    # Cracking
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _start_crack(self):
+        if self.cracking:
+            return
+
+        raw = self.hash_input.get("1.0", "end").strip()
+        hashes = [l.strip() for l in raw.splitlines() if l.strip()]
+        if not hashes:
+            self._status("No hashes provided!", color=BTN_STOP_TXT)
+            return
+
+        wordlist = self.wordlist_var.get().strip()
+        attack_mode = self._get_attack_mode()
+        if attack_mode in ("0", "1", "6", "7") and not wordlist:
+            self._status("Wordlist required for this attack mode!", color=BTN_STOP_TXT)
+            return
+
+        hashcat_path = self.hc_path_var.get().strip() or "hashcat"
+        mode = self._get_hash_mode()
+
+        self.temp_hash_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="hashcrack_")
+        self.temp_hash_file.write("\n".join(hashes))
+        self.temp_hash_file.close()
+
+        cmd = [
+            hashcat_path,
+            "-m", mode,
+            "-a", attack_mode,
+            "--status", "--status-timer=2",
+            "--force",
+            self.temp_hash_file.name,
+        ]
+        if wordlist:
+            cmd.append(wordlist)
+        rules = self.rules_var.get().strip()
+        if rules:
+            cmd += ["-r", rules]
+        extra = self.extra_args_var.get().strip()
+        if extra:
+            cmd += extra.split()
+
+        self._log("\n" + "=" * 60)
+        self._log(f"  Command: {' '.join(cmd)}")
+        self._log("=" * 60 + "\n")
+
+        self.results = {}
+        self._hash_set = set(hashes)
+        self.cracking = True
+        self.start_time = time.time()
+        self.progress.set(0)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
+        self.crack_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self._status("Cracking in progress...", color=BTN_START_TXT)
+
+        self.results_box.configure(state="normal")
+        self.results_box.delete("1.0", "end")
+        self.results_box.configure(state="disabled")
+        self.cracked_count_label.configure(text=f"0 / {len(hashes)}")
+
+        thread = threading.Thread(target=self._run_hashcat,
+                                  args=(cmd, hashes, hashcat_path, mode), daemon=True)
+        thread.start()
+        self._tick_timer()
+
+    def _run_hashcat(self, cmd, hashes, hashcat_path, mode):
+        """
+        Run hashcat, stream output, then run --show to catch potfile hits.
+        cwd is set to hashcat's own directory so it finds ./OpenCL/.
+        """
+        cwd = hashcat_cwd(cmd[0])
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                cwd=cwd,
+            )
+            for line in self.process.stdout:
+                line = line.rstrip()
+                if line:
+                    self.after(0, self._log, line)
+                    self._parse_cracked_line(line)
+            self.process.wait()
+            rc = self.process.returncode
+        except FileNotFoundError:
+            self.after(0, self._log,
+                       f"ERROR: hashcat not found at '{cmd[0]}'. Check the path in Settings.")
+            rc = -1
+        except Exception as e:
+            self.after(0, self._log, f"ERROR: {e}")
+            rc = -1
+
+        # ── KEY FIX: run --show to retrieve already-potfile'd hashes ─────────
+        # When hashcat says "All hashes found as potfile entries", it means they
+        # were cracked in a previous run and skipped this time.  --show makes
+        # hashcat print them out explicitly so we can display them.
+
+        self.after(0, self._log, "\n[Running --show to retrieve potfile results...]\n")
+        show_results = self._run_show(cmd[0], self.temp_hash_file.name, mode, cwd)
+        for h, p in show_results.items():
+            if h in self._hash_set and h not in self.results:
+                self.results[h] = p
+                self.after(0, self._add_result, h, p)
+
+        # Also scan potfile files directly as a belt-and-suspenders fallback
+        self.after(0, self._read_potfiles, hashes, hashcat_path)
+
+        self.after(0, self._finalize_crack, rc, hashes)
+
+    def _run_show(self, hashcat_path: str, hash_file: str, mode: str, cwd) -> dict:
+        """
+        Run `hashcat -m MODE --show HASHFILE` and return {hash: password} dict.
+        This is the reliable way to retrieve hashes already in the potfile.
+        """
+        results = {}
+        try:
+            cmd = [hashcat_path, "-m", mode, "--show", "--force", hash_file]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
+            output = result.stdout + result.stderr
+            for line in output.splitlines():
+                line = line.strip()
+                if ":" in line and not line.startswith("[") and not line.startswith("*"):
+                    h, _, p = line.partition(":")
+                    h, p = h.strip(), p.strip()
+                    if h in self._hash_set and p:
+                        results[h] = p
+        except Exception as e:
+            self.after(0, self._log, f"[--show failed: {e}]")
+        return results
+
+    def _parse_cracked_line(self, line):
+        """
+        Only treat a line as a crack if the left side of ':' is an actual
+        submitted hash.  Eliminates all false positives from log output.
+        """
+        if ":" not in line:
+            return
+        candidate_hash, _, candidate_pass = line.partition(":")
+        candidate_hash = candidate_hash.strip()
+        candidate_pass = candidate_pass.strip()
+        if (candidate_hash in self._hash_set
+                and candidate_pass
+                and candidate_hash not in self.results):
+            self.results[candidate_hash] = candidate_pass
+            self.after(0, self._add_result, candidate_hash, candidate_pass)
+
+    def _read_potfiles(self, hashes, hashcat_path: str):
+        """
+        Scan all candidate potfile locations (Windows exe dir, ~/.hashcat,
+        %APPDATA%/hashcat) and surface any matching hashes not yet shown.
+        """
+        for potfile in get_potfile_paths(hashcat_path):
+            if not potfile.exists():
+                continue
+            self.after(0, self._log, f"[Reading potfile: {potfile}]")
+            try:
+                with open(potfile, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if ":" not in line:
+                            continue
+                        h, _, p = line.partition(":")
+                        h, p = h.strip(), p.strip()
+                        if h in self._hash_set and p and h not in self.results:
+                            self.results[h] = p
+                            self.after(0, self._add_result, h, p)
+            except Exception as e:
+                self.after(0, self._log, f"[Potfile read error: {e}]")
+
+    def _finalize_crack(self, returncode, hashes):
+        self.cracking = False
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+
+        total = len(hashes)
+        cracked = len(self.results)
+        self.cracked_count_label.configure(text=f"{cracked} / {total}")
+        self.progress.set(cracked / total if total else 0)
+
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        self._log("\n" + "=" * 60)
+        self._log(f"  Done in {elapsed:.1f}s  |  Cracked: {cracked}/{total}")
+        self._log("=" * 60 + "\n")
+
+        if returncode in (0, 1):
+            color = BTN_START_TXT if cracked > 0 else TXT_MID
+            self._status(f"Finished -- {cracked}/{total} cracked in {elapsed:.1f}s", color=color)
+        else:
+            self._status(
+                f"Hashcat exited with code {returncode} -- see log for details",
+                color=BTN_STOP_TXT)
+
+        self.crack_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.timer_label.configure(text="")
+
+        if self.temp_hash_file:
+            try:
+                os.unlink(self.temp_hash_file.name)
+            except Exception:
+                pass
+
+    def _stop_crack(self):
+        if self.process and self.cracking:
+            self.process.terminate()
+            self._log("\n[STOPPED by user]\n")
+            self._status("Cracking stopped.", color=TXT_MID)
+            self.cracking = False
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.crack_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            self.timer_label.configure(text="")
+
+    def _tick_timer(self):
+        if self.cracking and self.start_time:
+            elapsed = int(time.time() - self.start_time)
+            m, s = divmod(elapsed, 60)
+            self.timer_label.configure(text=f"{m:02d}:{s:02d}")
+            self.after(1000, self._tick_timer)
+
+    # Results
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _add_result(self, hash_val, password):
+        short = hash_val[:28] + "..." if len(hash_val) > 28 else hash_val
+        self.results_box.configure(state="normal")
+        self.results_box.insert("end", f"{short}:{password}\n")
+        self.results_box.configure(state="disabled")
+        self.results_box.see("end")
+        total = len(self._hash_set) or 1
+        self.cracked_count_label.configure(text=f"{len(self.results)} / {total}")
+
+    def _copy_results(self):
+        if not self.results:
+            self._status("No results to copy yet.", color=TXT_MID)
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(f"{h}:{p}" for h, p in self.results.items()))
+        self._status(f"Copied {len(self.results)} result(s) to clipboard.", color=TXT_LIGHT)
+
+    def _export_results(self):
+        if not self.results:
+            self._status("No results to export yet.", color=TXT_MID)
+            return
+        import tkinter.filedialog as fd
+        path = fd.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"cracked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        if path:
+            with open(path, "w") as f:
+                f.write("# HashCrack Pro -- Results\n")
+                f.write(f"# {datetime.now().isoformat()}\n\n")
+                for h, p in self.results.items():
+                    f.write(f"{h}:{p}\n")
+            self._status(f"Exported to {path}", color=TXT_LIGHT)
+
+    def _clear_all(self):
+        self.hash_input.delete("1.0", "end")
+        self.results_box.configure(state="normal")
+        self.results_box.delete("1.0", "end")
+        self.results_box.configure(state="disabled")
+        self.results = {}
+        self._hash_set = set()
+        self.hash_count_label.configure(text="0 hashes")
+        self.cracked_count_label.configure(text="0 / 0")
+        self.progress.set(0)
+        self._status("Cleared.", color=TXT_DIM)
+
+    def _clear_log(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+    # UI Helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _log(self, text):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", text + "\n")
+        self.log_box.configure(state="disabled")
+        self.log_box.see("end")
+
+    def _status(self, text, color=TXT_DIM):
+        self.status_label.configure(text=text, text_color=color)
+
+    def _update_hash_count(self, _event=None):
+        n = len([l for l in self.hash_input.get("1.0", "end").strip().splitlines() if l.strip()])
+        self.hash_count_label.configure(text=f"{n} hash{'es' if n != 1 else ''}")
+
+    # Settings
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _browse_hashcat(self):
+        import tkinter.filedialog as fd
+        p = fd.askopenfilename(title="Select hashcat executable",
+                               filetypes=[("Executables", "*.exe *"), ("All", "*.*")])
+        if p:
+            self.hc_path_var.set(p)
+            self.after(100, self._check_hashcat)
+
+    def _browse_wordlist(self):
+        import tkinter.filedialog as fd
+        p = fd.askopenfilename(title="Select wordlist",
+                               filetypes=[("Text files", "*.txt"), ("All", "*.*")])
+        if p:
+            self.wordlist_var.set(p)
+
+    def _browse_rules(self):
+        import tkinter.filedialog as fd
+        p = fd.askopenfilename(title="Select rules file",
+                               filetypes=[("Rule files", "*.rule *.rules"), ("All", "*.*")])
+        if p:
+            self.rules_var.set(p)
+
+    def _save_settings(self):
+        self.config.update({
+            "hashcat_path": self.hc_path_var.get().strip(),
+            "wordlist_path": self.wordlist_var.get().strip(),
+            "rules_path": self.rules_var.get().strip(),
+            "last_hash_type": self._get_hash_mode(),
+            "attack_mode": self._get_attack_mode(),
+            "custom_args": self.extra_args_var.get().strip(),
+        })
+        save_config(self.config)
+        self._status("Settings saved.", color=TXT_LIGHT)
+
+    def _check_hashcat(self):
+        path = self.hc_path_var.get().strip() or "hashcat"
+        cwd = hashcat_cwd(path)
+        try:
+            result = subprocess.run(
+                [path, "--version"],
+                capture_output=True, text=True, timeout=8, cwd=cwd)
+            raw = (result.stdout + result.stderr).strip()
+            version = next(
+                (l.strip() for l in raw.splitlines() if re.search(r'v?\d+\.\d+', l)),
+                raw.splitlines()[0] if raw.splitlines() else "unknown")
+            self.hc_status_label.configure(text=f"hashcat {version}", text_color=TXT_LIGHT)
+            self._status(f"hashcat found: {version}", color=TXT_LIGHT)
+        except FileNotFoundError:
+            self.hc_status_label.configure(text="hashcat NOT FOUND", text_color=BTN_STOP_TXT)
+            self._status("hashcat not found -- browse to hashcat.exe in Settings.",
+                         color=BTN_STOP_TXT)
+        except Exception as e:
+            self.hc_status_label.configure(text="Error checking hashcat", text_color=TXT_MID)
+            self._status(f"hashcat check failed: {e}", color=TXT_MID)
+
+    def _diagnose_path(self):
+        """
+        Print a detailed diagnostic to the log so the user can see exactly
+        what Python sees when trying to find and run hashcat.
+        """
+        path = self.hc_path_var.get().strip() or "hashcat"
+        self._log("\n" + "=" * 60)
+        self._log("  PATH DIAGNOSTIC")
+        self._log("=" * 60)
+        self._log(f"  Configured path : {path}")
+        self._log(f"  Path is absolute: {Path(path).is_absolute()}")
+        self._log(f"  File exists     : {Path(path).exists()}")
+        self._log(f"  Is a file       : {Path(path).is_file()}")
+
+        cwd = hashcat_cwd(path)
+        self._log(f"  Will use cwd    : {cwd}")
+
+        if cwd:
+            cwd_path = Path(cwd)
+            self._log(f"  cwd exists      : {cwd_path.exists()}")
+            if cwd_path.exists():
+                files = [f.name for f in cwd_path.iterdir()]
+                self._log(f"  Files in cwd    : {', '.join(sorted(files)[:20])}")
+
+        which = shutil.which(path)
+        self._log(f"  shutil.which()  : {which}")
+
+        self._log(f"  Potfile candidates:")
+        for p in get_potfile_paths(path):
+            self._log(f"    {'EXISTS' if p.exists() else 'missing':7s}  {p}")
+
+        self._log("  Attempting --version...")
+        try:
+            r = subprocess.run([path, "--version"], capture_output=True,
+                               text=True, timeout=8, cwd=cwd)
+            self._log(f"  Return code : {r.returncode}")
+            self._log(f"  stdout      : {r.stdout.strip()[:200]}")
+            self._log(f"  stderr      : {r.stderr.strip()[:200]}")
+        except FileNotFoundError as e:
+            self._log(f"  FileNotFoundError: {e}")
+            self._log("  --> Python cannot find the executable at this path.")
+            self._log("  --> Use the '...' browse button to select hashcat.exe directly.")
+        except Exception as e:
+            self._log(f"  Exception: {e}")
+
+        self._log("=" * 60 + "\n")
+
+if __name__ == "__main__":
+    app = HashCrackPro()
+    app.mainloop()
