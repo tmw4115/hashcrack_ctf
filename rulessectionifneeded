@@ -1,0 +1,20 @@
+**RULES SECTION OF THE PROGRAM IF NEEDED > README (optional)**
+
+A rules file tells hashcat how to mutate each word in your wordlist before trying it. 
+So instead of just trying password, hashcat will also try Password, p@ssword, password1, PASSWORD, etc., all derived from the same base word automatically.
+
+*Why it matters for CTFs*
+Wordlists alone (even rockyou) miss a lot. Most real passwords aren't dictionary words exactly. People like to capitalize, add numbers, swap letters for symbols. Rules bridge that gap without needing a bigger wordlist.
+Common rules files that ship with hashcat (in the rules/ folder next to your exe)
+FileWhat it doesbest64.rule64 high-value mutations, fast, good starting pointdive.ruleVery large, thorough, slowerOneRuleToRuleThemAll.ruleCommunity favourite for CTFs, aggressiverockyou-30000.rule30k rules,
+very deep coveragetoggles5.ruleTries all capitalisation combinations
+Example path to put in the field
+D:/hashcat/rules/best64.rule
+Practical CTF workflow
+
+First pass — wordlist only, no rules (fast)
+If hashes remain — add best64.rule, run again
+Still stuck — swap to dive.rule or OneRuleToRuleThemAll.rule
+Last resort — brute force with Attack Mode 3 + mask
+
+The ... browse button next to the field will let you navigate directly to your hashcat rules/ folder so you don't have to type the path manually.
