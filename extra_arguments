@@ -1,0 +1,29 @@
+**Extra Arguments README**
+
+Some practical CTF examples of what you'd put there:
+
+Performance / compatibility
+
+--force
+already added by default, but if you remove it from code this is where you'd put it
+--opencl-device-types 1,2 — force CPU+GPU together
+--workload-profile 3 — crank up GPU utilization
+
+Brute-force masks (when using Attack Mode 3)
+
+?a?a?a?a?a?a — 6-char brute force, all character classes
+?d?d?d?d?d?d?d?d — 8-digit PIN
+?u?l?l?l?d?d — uppercase + 4 lowercase + 2 digits
+
+Incremental / smart cracking
+
+--increment --increment-min=4 --increment-max=8 — try all lengths 4–8
+--username — if your hash file has user:hash format (strips the username)
+--remove — delete hashes from the input file as they're cracked
+
+Output control
+
+--outfile cracked.txt --outfile-format 2 — write results to a separate file
+-O — optimized kernel, faster but limits max password length to 32
+
+Basically anything you'd type after the hashcat command in a terminal can go there. It's most useful for one-off flags that don't warrant a dedicated UI control.
